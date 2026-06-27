@@ -25,6 +25,9 @@ CFG = {
     'openrouter': os.environ.get('OPENROUTER_KEY', ''),
     'risk_pct':   float(os.environ.get('RISK_PCT', '1.5')),
     'trailing_sl': True,
+    'trailing_pct': float(os.environ.get('TRAILING_PCT', '4.0')),  # 4% trail default
+    'min_profit_lock': float(os.environ.get('MIN_PROFIT_LOCK', '1.5')),  # 1.5% min profit before trailing activates
+    'use_fixed_target': False,  # False = trailing only, True = fixed target
     'token_set_at': None,
 }
 
@@ -380,15 +383,35 @@ def calc_qty(price, at, sl_pct):
     return max(1, min(int(risk/sl_amt), int(CFG['capital']/price)))
 
 def update_trailing(sym, cur):
-    if not CFG['trailing_sl'] or sym not in STATE['positions']: return
+    if sym not in STATE['positions']: return
     pos = STATE['positions'][sym]
-    strat = STRATS.get(pos.get('strategy', CFG['strategy']), STRATS['MOMENTUM'])
+    trail_pct = CFG['trailing_pct'] / 100
+    min_profit = CFG['min_profit_lock'] / 100
+
     if pos['side'] == 'BUY':
-        new_sl = cur*(1-strat['sl']/100)
-        if new_sl > pos['sl']: pos['sl'] = round(new_sl,2)
+        # Track highest price seen
+        if cur > pos.get('peak', pos['entry']):
+            pos['peak'] = cur
+        peak = pos.get('peak', pos['entry'])
+        profit_pct = (peak - pos['entry']) / pos['entry']
+        # Activate trailing only after min profit reached
+        if profit_pct >= min_profit:
+            new_sl = round(peak * (1 - trail_pct), 2)
+            if new_sl > pos['sl']:
+                pos['sl'] = new_sl
+                add_log(f"Trail UP {sym}: Peak={peak:.2f} SL={new_sl:.2f} (+{profit_pct*100:.1f}%)")
     else:  # SHORT
-        new_sl = cur*(1+strat['sl']/100)
-        if new_sl < pos['sl']: pos['sl'] = round(new_sl,2)
+        # Track lowest price seen
+        if cur < pos.get('peak', pos['entry']):
+            pos['peak'] = cur
+        peak = pos.get('peak', pos['entry'])
+        profit_pct = (pos['entry'] - peak) / pos['entry']
+        # Activate trailing only after min profit reached
+        if profit_pct >= min_profit:
+            new_sl = round(peak * (1 + trail_pct), 2)
+            if new_sl < pos['sl']:
+                pos['sl'] = new_sl
+                add_log(f"Trail DN {sym}: Peak={peak:.2f} SL={new_sl:.2f} (+{profit_pct*100:.1f}%)")
 
 def close_pos(sym, reason, exit_price=None):
     if sym not in STATE['positions']: return
@@ -457,17 +480,23 @@ def scan():
         update_trailing(sym, cur)
         strat = STRATS.get(pos.get('strategy',CFG['strategy']), STRATS['MOMENTUM'])
         if pos['side'] == 'BUY':
-            tgt = pos['entry'] * (1 + strat['tgt']/100)
             if cur <= pos['sl']:
-                close_pos(sym, 'SL Hit', cur)
-            elif cur >= tgt:
-                close_pos(sym, 'Target Hit', cur)
-        else:  # SHORT — profit when price falls
-            tgt = pos['entry'] * (1 - strat['tgt']/100)
+                profit_pct = (cur - pos['entry']) / pos['entry'] * 100
+                reason = f'Trail SL Hit (+{profit_pct:.1f}%)' if profit_pct > 0 else f'SL Hit ({profit_pct:.1f}%)'
+                close_pos(sym, reason, cur)
+            elif CFG['use_fixed_target']:
+                tgt = pos['entry'] * (1 + strat['tgt']/100)
+                if cur >= tgt:
+                    close_pos(sym, f'Target Hit (+{strat["tgt"]}%)', cur)
+        else:  # SHORT
             if cur >= pos['sl']:
-                close_pos(sym, 'SL Hit (Short)', cur)
-            elif cur <= tgt:
-                close_pos(sym, 'Target Hit (Short)', cur)
+                profit_pct = (pos['entry'] - cur) / pos['entry'] * 100
+                reason = f'Trail SL Hit (+{profit_pct:.1f}%)' if profit_pct > 0 else f'SL Hit ({profit_pct:.1f}%)'
+                close_pos(sym, reason, cur)
+            elif CFG['use_fixed_target']:
+                tgt = pos['entry'] * (1 - strat['tgt']/100)
+                if cur <= tgt:
+                    close_pos(sym, f'Target Hit (+{strat["tgt"]}%)', cur)
 
     if not trading_time(): return
     if len(STATE['positions']) >= CFG['max_trades']: return
@@ -677,6 +706,19 @@ body{background:#0a0a0f;color:#e0e0e0;font-family:'Courier New',monospace;font-s
     <button class="btn btn-blue" onclick="saveConfig()" style="margin-top:8px">Save Config</button>
   </div>
   <div class="card">
+    <div style="color:#00d4ff;font-size:12px;font-weight:bold;margin-bottom:8px">TRAILING SL CONFIG</div>
+    <label style="color:#888;font-size:11px">Trailing % (price peak se kitna girne pe becho)</label>
+    <input class="inp" id="cfg-trail" type="number" step="0.5" placeholder="4.0">
+    <label style="color:#888;font-size:11px">Min Profit % (trailing activate hone ke liye)</label>
+    <input class="inp" id="cfg-minprofit" type="number" step="0.5" placeholder="1.5">
+    <label style="color:#888;font-size:11px">Fixed Target use karo?</label>
+    <select class="inp" id="cfg-fixtgt">
+      <option value="false">No — Sirf Trailing (Recommended)</option>
+      <option value="true">Yes — Fixed Target bhi</option>
+    </select>
+    <button class="btn btn-blue" onclick="saveTrailing()" style="margin-top:8px">Save Trailing Config</button>
+  </div>
+  <div class="card">
     <div style="color:#ff4444;font-size:12px;font-weight:bold;margin-bottom:8px">EMERGENCY</div>
     <button class="btn btn-red" onclick="closeAll()">CLOSE ALL POSITIONS</button>
   </div>
@@ -815,6 +857,16 @@ async function closeAll(){
   await fetch('/api/closeall',{method:'POST'});
   setTimeout(fetchState,500);
 }
+async function saveTrailing(){
+  const data={
+    trailing_pct:parseFloat(document.getElementById('cfg-trail').value)||4.0,
+    min_profit_lock:parseFloat(document.getElementById('cfg-minprofit').value)||1.5,
+    use_fixed_target:document.getElementById('cfg-fixtgt').value==='true'
+  };
+  const r=await fetch('/api/trailing',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  const d=await r.json();
+  alert('Trailing config saved! Trail:'+data.trailing_pct+'% MinProfit:'+data.min_profit_lock+'%');
+}
 fetchState();
 setInterval(fetchState,5000);
 </script>
@@ -888,6 +940,15 @@ def api_config():
     if 'capital' in data: CFG['capital'] = int(data['capital'])
     if 'max_trades' in data: CFG['max_trades'] = int(data['max_trades'])
     if 'strategy' in data: CFG['strategy'] = data['strategy']
+    return jsonify({'status':'ok'})
+
+@app.route('/api/trailing', methods=['POST'])
+def api_trailing():
+    data = request.get_json()
+    if 'trailing_pct' in data: CFG['trailing_pct'] = float(data['trailing_pct'])
+    if 'min_profit_lock' in data: CFG['min_profit_lock'] = float(data['min_profit_lock'])
+    if 'use_fixed_target' in data: CFG['use_fixed_target'] = bool(data['use_fixed_target'])
+    add_log(f"Trailing updated: {CFG['trailing_pct']}% trail, {CFG['min_profit_lock']}% min profit")
     return jsonify({'status':'ok'})
 
 @app.route('/api/close/<sym>', methods=['POST'])
