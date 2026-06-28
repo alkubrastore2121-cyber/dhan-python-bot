@@ -735,7 +735,7 @@ function showTab(t,el){
 }
 async function fetchState(){
   try{
-    const r=await fetch('/api/state');
+    const r=await fetch('http://'+window.location.host+'/api/state');
     const d=await r.json();
     updateUI(d);
   }catch(e){}
@@ -828,13 +828,13 @@ function updateUI(d){
   }
 }
 async function botCtrl(action){
-  await fetch('/api/bot/'+action,{method:'POST'});
+  await fetch('http://'+window.location.host+'/api/bot/'+action,{method:'POST'});
   setTimeout(fetchState,500);
 }
 async function saveToken(){
   const token=document.getElementById('cfg-token').value.trim();
   if(!token)return;
-  const r=await fetch('/api/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token})});
+  const r=await fetch('http://'+window.location.host+'/api/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token})});
   const d=await r.json();
   document.getElementById('token-status').textContent=d.message||'Saved';
   setTimeout(fetchState,1000);
@@ -845,16 +845,16 @@ async function saveConfig(){
     max_trades:parseInt(document.getElementById('cfg-maxtrades').value)||6,
     strategy:document.getElementById('cfg-strategy').value
   };
-  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  await fetch('http://'+window.location.host+'/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
 }
 async function closePos(sym){
   if(!confirm('Close '+sym+'?'))return;
-  await fetch('/api/close/'+sym,{method:'POST'});
+  await fetch('http://'+window.location.host+'/api/close/'+sym,{method:'POST'});
   setTimeout(fetchState,500);
 }
 async function closeAll(){
   if(!confirm('Close ALL positions?'))return;
-  await fetch('/api/closeall',{method:'POST'});
+  await fetch('http://'+window.location.host+'/api/closeall',{method:'POST'});
   setTimeout(fetchState,500);
 }
 async function saveTrailing(){
@@ -863,7 +863,7 @@ async function saveTrailing(){
     min_profit_lock:parseFloat(document.getElementById('cfg-minprofit').value)||1.5,
     use_fixed_target:document.getElementById('cfg-fixtgt').value==='true'
   };
-  const r=await fetch('/api/trailing',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  const r=await fetch('http://'+window.location.host+'/api/trailing',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
   const d=await r.json();
   alert('Trailing config saved! Trail:'+data.trailing_pct+'% MinProfit:'+data.min_profit_lock+'%');
 }
