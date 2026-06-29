@@ -279,6 +279,37 @@ def detect_pattern(p):
     if all(c[i]<c[i-1] for i in range(1,5)): return 'DOWNTREND'
     return 'NEUTRAL'
 
+def supertrend(closes, highs, lows, n=10, mult=3):
+    if len(closes) < n+1: return 'NEUTRAL', closes[-1]
+    atr_list = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        atr_list.append(tr)
+    if len(atr_list) < n: return 'NEUTRAL', closes[-1]
+    atr = np.mean(atr_list[-n:])
+    hl2 = (highs[-1] + lows[-1]) / 2
+    upper = hl2 + mult * atr
+    lower = hl2 - mult * atr
+    cur = closes[-1]
+    prev = closes[-2]
+    if cur > upper: return 'BUY', lower
+    if cur < lower: return 'SELL', upper
+    if prev > upper and cur <= upper: return 'SELL', upper
+    if prev < lower and cur >= lower: return 'BUY', lower
+    return 'NEUTRAL', (upper+lower)/2
+
+def darvas_box(closes, n=10):
+    if len(closes) < n+1: return 'NEUTRAL', 0, 0
+    recent = closes[-n:]
+    box_high = max(recent[:-1])
+    box_low = min(recent[:-1])
+    cur = closes[-1]
+    if cur > box_high * 1.002:
+        return 'BUY', box_high, box_low
+    if cur < box_low * 0.998:
+        return 'SELL', box_high, box_low
+    return 'NEUTRAL', box_high, box_low
+
 def generate_signal(prices, strat_name=None):
     if strat_name is None: strat_name = CFG['strategy']
     if strat_name == 'AI_AUTO':
@@ -322,6 +353,16 @@ def generate_signal(prices, strat_name=None):
     elif mom<-1.5: bear+=12; reasons.append(f'Mom({mom:.1f}%)')
     if 'MORNING_STAR' in pat or 'UPTREND' in pat: bull+=18; reasons.append(pat)
     if 'EVENING_STAR' in pat or 'DOWNTREND' in pat: bear+=18; reasons.append(pat)
+    # Supertrend
+    highs = [p*1.005 for p in prices]
+    lows = [p*0.995 for p in prices]
+    st_dir, st_level = supertrend(prices, highs, lows)
+    if st_dir == 'BUY': bull+=20; reasons.append('Supertrend BUY')
+    elif st_dir == 'SELL': bear+=20; reasons.append('Supertrend SELL')
+    # Darvas Box
+    db_dir, db_high, db_low = darvas_box(prices)
+    if db_dir == 'BUY': bull+=18; reasons.append(f'Darvas BO>{db_high:.0f}')
+    elif db_dir == 'SELL': bear+=18; reasons.append(f'Darvas BD<{db_low:.0f}')
     sent=STATE['market_sentiment']
     if sent=='BULLISH': bull+=8
     elif sent=='BEARISH': bear+=8
@@ -735,7 +776,7 @@ function showTab(t,el){
 }
 async function fetchState(){
   try{
-    const r=await fetch('http://'+window.location.host+'/api/state');
+    const r=await fetch('/api/state');
     const d=await r.json();
     updateUI(d);
   }catch(e){}
@@ -828,13 +869,13 @@ function updateUI(d){
   }
 }
 async function botCtrl(action){
-  await fetch('http://'+window.location.host+'/api/bot/'+action,{method:'POST'});
+  await fetch('/api/bot/'+action,{method:'POST'});
   setTimeout(fetchState,500);
 }
 async function saveToken(){
   const token=document.getElementById('cfg-token').value.trim();
   if(!token)return;
-  const r=await fetch('http://'+window.location.host+'/api/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token})});
+  const r=await fetch('/api/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token})});
   const d=await r.json();
   document.getElementById('token-status').textContent=d.message||'Saved';
   setTimeout(fetchState,1000);
@@ -845,16 +886,16 @@ async function saveConfig(){
     max_trades:parseInt(document.getElementById('cfg-maxtrades').value)||6,
     strategy:document.getElementById('cfg-strategy').value
   };
-  await fetch('http://'+window.location.host+'/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
 }
 async function closePos(sym){
   if(!confirm('Close '+sym+'?'))return;
-  await fetch('http://'+window.location.host+'/api/close/'+sym,{method:'POST'});
+  await fetch('/api/close/'+sym,{method:'POST'});
   setTimeout(fetchState,500);
 }
 async function closeAll(){
   if(!confirm('Close ALL positions?'))return;
-  await fetch('http://'+window.location.host+'/api/closeall',{method:'POST'});
+  await fetch('/api/closeall',{method:'POST'});
   setTimeout(fetchState,500);
 }
 async function saveTrailing(){
@@ -863,7 +904,7 @@ async function saveTrailing(){
     min_profit_lock:parseFloat(document.getElementById('cfg-minprofit').value)||1.5,
     use_fixed_target:document.getElementById('cfg-fixtgt').value==='true'
   };
-  const r=await fetch('http://'+window.location.host+'/api/trailing',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  const r=await fetch('/api/trailing',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
   const d=await r.json();
   alert('Trailing config saved! Trail:'+data.trailing_pct+'% MinProfit:'+data.min_profit_lock+'%');
 }
