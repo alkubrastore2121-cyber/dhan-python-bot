@@ -773,6 +773,7 @@ function showTab(tabName,el){
   document.getElementById('tab-'+tabName).classList.add('active');
   el.classList.add('active');
   currentTab=tabName;
+  fetchState();
 }
 async function fetchState(){
   try{
