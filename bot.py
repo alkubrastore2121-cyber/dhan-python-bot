@@ -767,19 +767,23 @@ body{background:#0a0a0f;color:#e0e0e0;font-family:'Courier New',monospace;font-s
 
 <script>
 let currentTab='dashboard';
-function showTab(t,el){
+function showTab(tabName,el){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  document.getElementById('tab-'+t).classList.add('active');
+  document.querySelectorAll('.tab').forEach(tab=>tab.classList.remove('active'));
+  document.getElementById('tab-'+tabName).classList.add('active');
   el.classList.add('active');
-  currentTab=t;
+  currentTab=tabName;
 }
 async function fetchState(){
   try{
     const r=await fetch('/api/state');
+    if(!r.ok){document.getElementById('hdr-status').textContent='API Error: '+r.status; return;}
     const d=await r.json();
     updateUI(d);
-  }catch(e){}
+  }catch(e){
+    document.getElementById('hdr-status').textContent='Err: '+e.message;
+    console.error('fetchState error:',e);
+  }
 }
 function updateUI(d){
   const s=d.stats||{};
