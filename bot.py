@@ -1,7 +1,40 @@
 #!/usr/bin/env python3
 import subprocess
 """
-Dhan Quantum Trader v7.0
+Dhan Quantum Trader v7.1 (bug-fix + risk-management pass)
+
+CHANGES FROM v7.0:
+  Indicator bug fixes:
+    - Supertrend no longer fabricates highs/lows as a constant +/-0.5% of
+      each price (which made the signal meaningless). It now uses a real
+      rolling max/min of the actual tick series as an honest proxy.
+    - MACD signal line was `macd * 0.9` (not a real signal line at all).
+      Now computed as a genuine EMA9 of the MACD line series.
+    - Stochastic %D was `%K * 0.9`. Now a real 3-period SMA of %K.
+  Risk-management additions (all configurable via env vars, see CFG below):
+    - Daily stats (today_pnl, today_trades, loss streak) now actually reset
+      at the start of each new calendar day. Before this, a max-loss stop
+      on day 1 would silently persist forever with no reset.
+    - Consecutive-loss circuit breaker: pauses new entries for a cooldown
+      window after N losses in a row (CONSEC_LOSS_LIMIT / COOLDOWN_MIN).
+    - Daily trade-count cap independent of concurrent-position cap
+      (MAX_DAILY_TRADES) - stops the bot from repeatedly re-entering after
+      closing positions.
+    - Per-sector exposure limit (MAX_SECTOR_EXPOSURE) so the bot can't end
+      up concentrated in one sector that all moves together.
+    - Max-position-value cap (MAX_POSITION_PCT) independent of stop-loss
+      tightness, bounding worst-case loss on any single name.
+    - TRADE_MODE (INTRADAY/SWING): controls product type (INTRADAY vs CNC),
+      the entry window, and forces an explicit end-of-day square-off for
+      intraday positions instead of relying solely on the broker's own
+      auto-square-off. SWING mode only takes BUY signals (Indian cash-market
+      rules don't allow overnight short selling).
+
+WHAT THIS DOES **NOT** DO: guarantee profitability, or even guarantee low
+losses. It fixes clear bugs and adds guardrails that bound worst-case risk.
+Before using with real money: run in paper/observation mode first, and
+validate the signal logic against historical data - none of that validation
+exists yet in this codebase.
 """
 import os, time, json, logging, threading, random
 import requests, schedule, numpy as np
@@ -29,6 +62,19 @@ CFG = {
     'min_profit_lock': float(os.environ.get('MIN_PROFIT_LOCK', '1.5')),  # 1.5% min profit before trailing activates
     'use_fixed_target': False,  # False = trailing only, True = fixed target
     'token_set_at': None,
+
+    # ---- Trading mode: INTRADAY (same-day square-off) or SWING (multi-day, CNC) ----
+    'trade_mode':  os.environ.get('TRADE_MODE', 'INTRADAY'),   # 'INTRADAY' or 'SWING'
+
+    # ---- Risk-management additions ----
+    'max_daily_trades':    int(os.environ.get('MAX_DAILY_TRADES', '10')),   # total trades allowed per day (not just concurrent)
+    'max_sector_exposure': int(os.environ.get('MAX_SECTOR_EXPOSURE', '1')), # max concurrent positions in same sector
+    'max_position_pct':    float(os.environ.get('MAX_POSITION_PCT', '35')),# no single position > this % of capital
+    'consec_loss_limit':   int(os.environ.get('CONSEC_LOSS_LIMIT', '3')),  # pause bot after N losses in a row
+    'cooldown_min':        int(os.environ.get('COOLDOWN_MIN', '15')),      # minutes to pause trading after hitting consec_loss_limit
+    'paused_until':        None,   # datetime until which new entries are blocked (cooldown)
+    'squareoff_time':      dtime(15, 15),   # intraday positions force-closed at/after this time
+    'auto_resume_daily':   os.environ.get('AUTO_RESUME_DAILY', 'false').lower() == 'true',  # if False (default), a max-loss stop requires you to manually press Start the next day
 }
 
 DHAN_API = 'https://api.dhan.co/v2'
@@ -76,6 +122,8 @@ STATE = {
     'data_source':'waiting','token_status':'not_set','error_count':0,
     'stats':{'trades':0,'wins':0,'losses':0,'today_pnl':0.0,'total_pnl':0.0,
              'best_trade':0.0,'worst_trade':0.0,'streak':0,'max_streak':0,'today_trades':0},
+    'stats_date': datetime.now().strftime('%Y-%m-%d'),
+    'token_warn_sent': False,
 }
 
 ANGEL_TOKENS = {
@@ -117,7 +165,12 @@ def trading_time():
     now = datetime.now()
     if now.weekday() >= 5: return False
     t = now.time()
-    return dtime(9,20) <= t <= dtime(15,15)
+    if CFG['trade_mode'] == 'SWING':
+        # Swing/CNC positions carry overnight, so there's no need to stop
+        # taking new entries early - just stay within the regular session
+        # (skip the noisy first few minutes at open).
+        return dtime(9,20) <= t <= dtime(15,20)
+    return dtime(9,20) <= t <= CFG['squareoff_time']
 
 def token_expires_in_str():
     if not CFG['token_set_at']: return 'Not set'
@@ -126,6 +179,25 @@ def token_expires_in_str():
     if rem.total_seconds() <= 0: return 'EXPIRED'
     h,m = divmod(int(rem.total_seconds())//60, 60)
     return f'{h}h {m}m'
+
+def token_hours_left():
+    """Numeric hours remaining (or None if no token set / already expired) -
+    used by the dashboard to color the token banner green/amber/red instead
+    of the user having to parse a text string themselves."""
+    if not CFG['token_set_at']: return None
+    exp = CFG['token_set_at'] + timedelta(hours=24)
+    rem = (exp - datetime.now()).total_seconds() / 3600
+    return round(rem, 2) if rem > 0 else 0
+
+def check_token_expiry_alert():
+    """Fires a single Telegram alert ~1 hour before the token expires, so you
+    don't have to keep the dashboard open to know it's about to die. Resets
+    when a fresh token is saved (see api_token below)."""
+    hrs = token_hours_left()
+    if hrs is not None and hrs <= 1 and not STATE['token_warn_sent']:
+        telegram('Dhan token expires in under 1 hour! Paste a fresh token on the dashboard or the bot will stop placing orders.')
+        add_log('Token expiring soon - Telegram alert sent', 'WARNING')
+        STATE['token_warn_sent'] = True
 
 def check_token():
     if not CFG['token'] or not CFG['client_id']:
@@ -260,15 +332,39 @@ def bb(p, n=20):
     sl = np.array(p[-n:], dtype=float); m = float(np.mean(sl)); s = float(np.std(sl))
     return round(m+2*s,2), round(m,2), round(m-2*s,2)
 
+def macd_line_series(p, fast=12, slow=26):
+    """Return the MACD line as a proper series (not a single guessed number),
+    so the signal line can be a real EMA of it instead of an arbitrary *0.9 fudge."""
+    if len(p) < slow + 1: return []
+    a = np.array(p, dtype=float)
+    def ema_series(arr, n):
+        k = 2/(n+1); out = np.zeros_like(arr)
+        out[0] = arr[0]
+        for i in range(1, len(arr)): out[i] = arr[i]*k + out[i-1]*(1-k)
+        return out
+    ef = ema_series(a, fast); es = ema_series(a, slow)
+    return (ef - es).tolist()
+
 def macd_calc(p):
-    if len(p) < 26: return 0,0,0
-    m = ema(p,12)-ema(p,26); return round(m,4), round(m*0.9,4), round(m*0.1,4)
+    line = macd_line_series(p)
+    if len(line) < 9: return 0,0,0
+    m = line[-1]
+    sig = ema(line, 9)          # real signal line = EMA9 of the MACD line, not m*0.9
+    hist = m - sig
+    return round(m,4), round(sig,4), round(hist,4)
 
 def stoch(p, n=14):
-    if len(p) < n: return 50,50
-    a = np.array(p[-n:], dtype=float); lo=min(a); hi=max(a)
-    if hi==lo: return 50,50
-    k=((p[-1]-lo)/(hi-lo))*100; return round(k,1), round(k*0.9,1)
+    """%K = position of last close in the n-period range.
+    %D = 3-period simple moving average of %K (proper definition, not %K*0.9)."""
+    if len(p) < n+2: return 50,50
+    k_vals = []
+    for i in range(n, len(p)+1):
+        window = p[i-n:i]
+        lo = min(window); hi = max(window)
+        k_vals.append(50.0 if hi==lo else ((window[-1]-lo)/(hi-lo))*100)
+    k = k_vals[-1]
+    d = float(np.mean(k_vals[-3:])) if len(k_vals) >= 3 else k
+    return round(k,1), round(d,1)
 
 def detect_pattern(p):
     if len(p) < 5: return 'NEUTRAL'
@@ -279,14 +375,27 @@ def detect_pattern(p):
     if all(c[i]<c[i-1] for i in range(1,5)): return 'DOWNTREND'
     return 'NEUTRAL'
 
-def supertrend(closes, highs, lows, n=10, mult=3):
-    if len(closes) < n+1: return 'NEUTRAL', closes[-1]
+def supertrend(closes, n=10, mult=3):
+    """NOTE: we only receive LTP ticks from the feed, not real OHLC candles, so a
+    true Supertrend (which needs real high/low per candle) isn't possible here.
+    Previously this was faked by inventing highs/lows as price*1.005/0.995 for
+    EVERY tick - a constant, made-up spread with no relation to actual volatility,
+    which made the signal meaningless.
+    This version instead uses the *actual* rolling max/min of the real tick
+    series as an honest (if still approximate) proxy for high/low, and real
+    tick-to-tick differences for true range. It's still an approximation of
+    candle-based Supertrend - treat it as a coarse trend filter, not gospel."""
+    if len(closes) < n+2: return 'NEUTRAL', closes[-1]
+    win = max(3, n // 2)
+    highs = [max(closes[max(0,i-win):i+1]) for i in range(len(closes))]
+    lows  = [min(closes[max(0,i-win):i+1]) for i in range(len(closes))]
     atr_list = []
     for i in range(1, len(closes)):
         tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
         atr_list.append(tr)
     if len(atr_list) < n: return 'NEUTRAL', closes[-1]
     atr = np.mean(atr_list[-n:])
+    if atr <= 0: return 'NEUTRAL', closes[-1]
     hl2 = (highs[-1] + lows[-1]) / 2
     upper = hl2 + mult * atr
     lower = hl2 - mult * atr
@@ -353,10 +462,8 @@ def generate_signal(prices, strat_name=None):
     elif mom<-1.5: bear+=12; reasons.append(f'Mom({mom:.1f}%)')
     if 'MORNING_STAR' in pat or 'UPTREND' in pat: bull+=18; reasons.append(pat)
     if 'EVENING_STAR' in pat or 'DOWNTREND' in pat: bear+=18; reasons.append(pat)
-    # Supertrend
-    highs = [p*1.005 for p in prices]
-    lows = [p*0.995 for p in prices]
-    st_dir, st_level = supertrend(prices, highs, lows)
+    # Supertrend (uses real rolling high/low proxy now, see supertrend() docstring)
+    st_dir, st_level = supertrend(prices)
     if st_dir == 'BUY': bull+=20; reasons.append('Supertrend BUY')
     elif st_dir == 'SELL': bear+=20; reasons.append('Supertrend SELL')
     # Darvas Box
@@ -384,7 +491,7 @@ def place_order(sym, sec_id, side, qty, otype='MARKET', price=0.0, trigger=0.0):
         'dhanClientId': CFG['client_id'],
         'transactionType': dhan_side,
         'exchangeSegment': 'NSE_EQ',
-        'productType': 'INTRADAY',
+        'productType': 'INTRADAY' if CFG['trade_mode'] == 'INTRADAY' else 'CNC',
         'orderType': otype,
         'validity': 'DAY',
         'tradingSymbol': sym,
@@ -418,10 +525,18 @@ def place_order(sym, sec_id, side, qty, otype='MARKET', price=0.0, trigger=0.0):
     return None
 
 def calc_qty(price, at, sl_pct):
+    # Qty from risk-per-trade (how much money we're willing to lose if SL hits)...
     risk = CFG['capital'] * CFG['risk_pct'] / 100
     sl_amt = price * sl_pct / 100
     if sl_amt <= 0: sl_amt = at or price*0.01
-    return max(1, min(int(risk/sl_amt), int(CFG['capital']/price)))
+    qty_by_risk = int(risk/sl_amt)
+    # ...capped so a single position can never exceed max_position_pct of capital,
+    # even if the SL is very tight (tight SL alone shouldn't let a huge, concentrated
+    # bet slip through - this bounds worst-case exposure to one stock).
+    max_position_value = CFG['capital'] * CFG['max_position_pct'] / 100
+    qty_by_exposure_cap = int(max_position_value / price)
+    qty_by_funds = int(CFG['capital']/price)
+    return max(1, min(qty_by_risk, qty_by_exposure_cap, qty_by_funds))
 
 def update_trailing(sym, cur):
     if sym not in STATE['positions']: return
@@ -476,6 +591,12 @@ def close_pos(sym, reason, exit_price=None):
     else:
         s['losses']+=1; s['streak']=min(0,s.get('streak',0))-1
         s['worst_trade']=min(s.get('worst_trade',0),pnl)
+        # Consecutive-loss circuit breaker: pause new entries for a cooldown
+        # period after N losses in a row, instead of letting the bot keep
+        # firing into a bad regime (a common cause of outsized daily losses).
+        if abs(s['streak']) >= CFG['consec_loss_limit']:
+            CFG['paused_until'] = datetime.now() + timedelta(minutes=CFG['cooldown_min'])
+            add_log(f"{abs(s['streak'])} losses in a row - pausing new entries for {CFG['cooldown_min']} min", 'WARNING')
     emoji = 'WIN' if pnl>0 else 'LOSS'
     add_log(f'{emoji} CLOSED {sym} | {reason} | Entry:{pos["entry"]:.2f}->Exit:{exit_price:.2f} | PnL:{pnl:+.2f}')
     telegram(f'{emoji} <b>{sym} CLOSED</b>\n{reason}\nEntry:{pos["entry"]:.2f} Exit:{exit_price:.2f}\nPnL:<b>{pnl:+.2f}</b>\nToday:{s["today_pnl"]:+.2f}')
@@ -497,13 +618,46 @@ def get_funds():
     except Exception as e:
         add_log(f'Funds error: {e}','WARNING'); return STATE['funds']
 
+def square_off_check():
+    """Force-close every INTRADAY position before the exchange session ends.
+    The old code relied on the broker's own auto-square-off, which is a real
+    (and sometimes costly) gap - if that mechanism is delayed or fails, an
+    intraday position can get carried into a margin call overnight."""
+    if CFG['trade_mode'] != 'INTRADAY': return
+    if datetime.now().time() < CFG['squareoff_time']: return
+    for sym in list(STATE['positions'].keys()):
+        cur = STATE['prices'].get(sym,{}).get('price')
+        close_pos(sym, 'EOD Square-off', cur)
+
+def reset_daily_stats_if_new_day():
+    """Bug in the original code: 'today_pnl', 'today_trades' and the loss
+    streak never reset, so a max-loss stop from Monday would silently carry
+    into Tuesday forever (bot never trades again without a manual restart),
+    and today_pnl would just keep accumulating across days instead of
+    reflecting the actual day's PnL."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    if STATE.get('stats_date') != today:
+        s = STATE['stats']
+        s['today_pnl'] = 0.0
+        s['today_trades'] = 0
+        s['streak'] = 0
+        STATE['stats_date'] = today
+        CFG['paused_until'] = None
+        if not STATE['running'] and CFG['auto_resume_daily']:
+            STATE['running'] = True
+            add_log(f'New trading day ({today}) - daily stats reset, bot auto-resumed')
+        else:
+            add_log(f'New trading day ({today}) - daily stats reset'
+                     + ('' if STATE['running'] else ' (bot stopped - press Start to trade today)'))
+
 def scan():
+    reset_daily_stats_if_new_day()
     if not STATE['running']: return
     if not market_open():
         add_log('Market closed - Standby'); return
     s = STATE['stats']
 
-    # Daily limits check
+    # Daily PnL limits (unchanged, but now checked before anything else runs)
     if s['today_pnl'] <= -abs(CFG['max_loss']):
         add_log('Max loss hit! Bot stopped.','WARNING')
         STATE['running'] = False; return
@@ -539,8 +693,19 @@ def scan():
                 if cur <= tgt:
                     close_pos(sym, f'Target Hit (+{strat["tgt"]}%)', cur)
 
+    # Force-close intraday positions before session end - checked every scan,
+    # independent of whether new entries are allowed below.
+    square_off_check()
+
     if not trading_time(): return
     if len(STATE['positions']) >= CFG['max_trades']: return
+
+    # Circuit breakers that block NEW entries only (existing positions still
+    # get managed above, so we never abandon an open trade mid-air).
+    if s['today_trades'] >= CFG['max_daily_trades']:
+        return  # daily trade-count cap hit - stop opening fresh positions for the day
+    if CFG['paused_until'] and datetime.now() < CFG['paused_until']:
+        return  # cooling down after a losing streak
 
     # Scan for new entry signals
     signals = []
@@ -553,6 +718,10 @@ def scan():
         result = generate_signal(closes)
         sig_dir = result[0]; conf = result[1]; inds = result[2]
         reasons = result[3]; strat_nm = result[4]
+        # SWING mode trades via CNC (delivery), and Indian cash-market rules
+        # don't allow overnight short selling - so only take BUY signals.
+        if CFG['trade_mode'] == 'SWING' and sig_dir == 'SELL':
+            continue
         if sig_dir in ('BUY','SELL') and conf > 55:
             cur = pd.get('price',0)
             if cur <= 0: continue
@@ -569,16 +738,28 @@ def scan():
     STATE['signals'] = signals[:10]
     STATE['last_scan'] = datetime.now().strftime('%H:%M:%S')
 
-    # Execute top signals
+    # Execute top signals, respecting per-sector exposure limits so the bot
+    # can't end up with e.g. 4 concurrent Banking positions that will all
+    # move together in a sector-wide move (concentration risk, not diversification).
+    open_sectors = {}
+    for p in STATE['positions'].values():
+        sec = next((w.get('sector','') for w in WATCHLIST if w['sym']==p['sym']), '')
+        open_sectors[sec] = open_sectors.get(sec,0) + 1
+
     for sig in signals[:3]:
         if len(STATE['positions']) >= CFG['max_trades']: break
+        if s['today_trades'] >= CFG['max_daily_trades']: break
+        sec = sig.get('sector','')
+        if open_sectors.get(sec,0) >= CFG['max_sector_exposure']:
+            add_log(f"Skip {sig['sym']}: {sec} sector exposure limit reached")
+            continue
         sym = sig['sym']
         cur = sig['price']
         strat = STRATS.get(sig['strat'], STRATS['MOMENTUM'])
         if sig['dir'] == 'BUY':
             sl = round(cur*(1-strat['sl']/100),2)
             side = 'BUY'
-        else:  # SELL signal = SHORT entry
+        else:  # SELL signal = SHORT entry (intraday only - filtered above for SWING)
             sl = round(cur*(1+strat['sl']/100),2)
             side = 'SHORT'
         qty = sig['qty']
@@ -590,6 +771,7 @@ def scan():
                 'strategy':sig['strat'],'oid':oid,
                 'time':datetime.now().strftime('%H:%M')
             }
+            open_sectors[sec] = open_sectors.get(sec,0) + 1
             add_log(f'{side} {sym} @ {cur} | SL:{sl} | Conf:{sig["conf"]}%')
             telegram(f'<b>{side} {sym}</b> @ {cur}\nSL:{sl} | Conf:{sig["conf"]}%\n{", ".join(sig["reasons"][:3])}')
 
@@ -667,6 +849,15 @@ body{background:#0a0a0f;color:#e0e0e0;font-family:'Courier New',monospace;font-s
 </div>
 
 <div id="tab-dashboard" class="panel active">
+  <div class="card" id="token-card" style="border:1px solid #374151">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <div style="color:#00d4ff;font-size:12px;font-weight:bold">DHAN TOKEN <span style="color:#666;font-weight:normal">(expires every 24h)</span></div>
+      <div id="token-banner" style="font-size:11px;font-weight:bold;padding:3px 8px;border-radius:4px">--</div>
+    </div>
+    <textarea id="cfg-token" class="inp" rows="2" placeholder="Paste new Dhan Access Token here"></textarea>
+    <button class="btn btn-blue" onclick="saveToken()" style="width:100%">Save Token</button>
+    <div id="token-status" style="margin-top:6px;color:#888;font-size:12px"></div>
+  </div>
   <div class="card">
     <div class="grid2">
       <div><div class="stat-val" id="d-pnl">--</div><div class="stat-lbl">Today P&L</div></div>
@@ -682,7 +873,6 @@ body{background:#0a0a0f;color:#e0e0e0;font-family:'Courier New',monospace;font-s
   </div>
   <div class="card" style="text-align:center">
     <div id="d-sentiment">--</div>
-    <div style="margin-top:6px;color:#555;font-size:11px">Sentiment | <span id="d-token-exp" style="color:#ffaa00">--</span></div>
   </div>
   <div style="text-align:center;margin:12px 0">
     <button class="btn btn-green" onclick="botCtrl('start')">START BOT</button>
@@ -727,12 +917,6 @@ body{background:#0a0a0f;color:#e0e0e0;font-family:'Courier New',monospace;font-s
 
 <div id="tab-settings" class="panel">
   <div class="card">
-    <div style="color:#00d4ff;font-size:12px;font-weight:bold;margin-bottom:8px">DHAN TOKEN</div>
-    <textarea id="cfg-token" class="inp" rows="3" placeholder="Paste Dhan Access Token here"></textarea>
-    <button class="btn btn-blue" onclick="saveToken()">Save Token</button>
-    <div id="token-status" style="margin-top:6px;color:#888;font-size:12px"></div>
-  </div>
-  <div class="card">
     <div style="color:#00d4ff;font-size:12px;font-weight:bold;margin-bottom:8px">CONFIG</div>
     <label style="color:#888;font-size:11px">Capital (Rs)</label>
     <input class="inp" id="cfg-capital" type="number" placeholder="5000">
@@ -767,24 +951,19 @@ body{background:#0a0a0f;color:#e0e0e0;font-family:'Courier New',monospace;font-s
 
 <script>
 let currentTab='dashboard';
-function showTab(tabName,el){
+function showTab(t,el){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(tab=>tab.classList.remove('active'));
-  document.getElementById('tab-'+tabName).classList.add('active');
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById('tab-'+t).classList.add('active');
   el.classList.add('active');
-  currentTab=tabName;
-  fetchState();
+  currentTab=t;
 }
 async function fetchState(){
   try{
     const r=await fetch('/api/state');
-    if(!r.ok){document.getElementById('hdr-status').textContent='API Error: '+r.status; return;}
     const d=await r.json();
     updateUI(d);
-  }catch(e){
-    document.getElementById('hdr-status').textContent='Err: '+e.message;
-    console.error('fetchState error:',e);
-  }
+  }catch(e){}
 }
 function updateUI(d){
   const s=d.stats||{};
@@ -799,8 +978,22 @@ function updateUI(d){
   document.getElementById('d-pos').textContent=Object.keys(d.positions||{}).length;
   const sent=d.market_sentiment||'NEUTRAL';
   document.getElementById('d-sentiment').innerHTML='<span class="badge badge-'+(sent=='BULLISH'?'bull':sent=='BEARISH'?'bear':'neu')+'">'+sent+'</span>';
-  document.getElementById('d-token-exp').textContent='Token: '+d.token_expires;
   document.getElementById('hdr-status').innerHTML='<span class="status-dot '+(d.running?'dot-green':'dot-red')+'"></span>'+(d.running?'RUNNING':'STOPPED');
+
+  // Token banner: green if plenty of time left, amber if <2h left, red if expired/missing.
+  // The bot can silently stop placing orders on an expired token, so this needs
+  // to be impossible to miss - hence living at the top of the Dashboard tab.
+  const hrsLeft = d.token_hours_left;
+  const banner = document.getElementById('token-banner');
+  if (d.token_status === 'missing' || hrsLeft === null || hrsLeft === undefined) {
+    banner.textContent = 'NOT SET'; banner.style.background='#aa222233'; banner.style.color='#ff4444';
+  } else if (d.token_status === 'expired' || hrsLeft <= 0) {
+    banner.textContent = 'EXPIRED - paste new token below'; banner.style.background='#aa222233'; banner.style.color='#ff4444';
+  } else if (hrsLeft <= 2) {
+    banner.textContent = 'Expires in '+d.token_expires+' - refresh soon'; banner.style.background='#ffaa0033'; banner.style.color='#ffaa00';
+  } else {
+    banner.textContent = 'Active - '+d.token_expires+' left'; banner.style.background='#00aa5533'; banner.style.color='#00ff88';
+  }
 
   if(currentTab=='market'){
     let html='';
@@ -938,9 +1131,17 @@ def api_state():
         'last_scan': STATE['last_scan'],
         'token_status': STATE['token_status'],
         'token_expires': token_expires_in_str(),
+        'token_hours_left': token_hours_left(),
         'logs': list(STATE['logs'])[:60],
         'stats': STATE['stats'],
         'market_open': market_open(),
+        'trade_mode': CFG['trade_mode'],
+        'max_daily_trades': CFG['max_daily_trades'],
+        'max_sector_exposure': CFG['max_sector_exposure'],
+        'max_position_pct': CFG['max_position_pct'],
+        'consec_loss_limit': CFG['consec_loss_limit'],
+        'cooldown_min': CFG['cooldown_min'],
+        'paused_until': CFG['paused_until'].strftime('%H:%M:%S') if CFG['paused_until'] and datetime.now() < CFG['paused_until'] else None,
     })
 
 @app.route('/api/bot/start', methods=['POST'])
@@ -964,6 +1165,7 @@ def api_token():
     CFG['token'] = token
     CFG['token_set_at'] = datetime.now()
     STATE['token_status'] = 'active'
+    STATE['token_warn_sent'] = False
     try:
         env_file = '/etc/dhanbot.env'
         with open(env_file, 'r') as f:
@@ -986,6 +1188,14 @@ def api_config():
     if 'capital' in data: CFG['capital'] = int(data['capital'])
     if 'max_trades' in data: CFG['max_trades'] = int(data['max_trades'])
     if 'strategy' in data: CFG['strategy'] = data['strategy']
+    if 'trade_mode' in data and data['trade_mode'] in ('INTRADAY','SWING'):
+        CFG['trade_mode'] = data['trade_mode']
+        add_log(f"Trade mode set to {CFG['trade_mode']}")
+    if 'max_daily_trades' in data: CFG['max_daily_trades'] = int(data['max_daily_trades'])
+    if 'max_sector_exposure' in data: CFG['max_sector_exposure'] = int(data['max_sector_exposure'])
+    if 'max_position_pct' in data: CFG['max_position_pct'] = float(data['max_position_pct'])
+    if 'consec_loss_limit' in data: CFG['consec_loss_limit'] = int(data['consec_loss_limit'])
+    if 'cooldown_min' in data: CFG['cooldown_min'] = int(data['cooldown_min'])
     return jsonify({'status':'ok'})
 
 @app.route('/api/trailing', methods=['POST'])
@@ -1013,6 +1223,7 @@ def bot_thread():
     angel_login()
     schedule.every(30).seconds.do(scan)
     schedule.every(5).minutes.do(get_funds)
+    schedule.every(2).minutes.do(check_token_expiry_alert)
     while True:
         schedule.run_pending()
         time.sleep(1)
