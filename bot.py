@@ -650,6 +650,12 @@ select.inp option{background:#0a1628}
 </div>
 
 <div id="p-dash" class="panel on">
+  <div class="card" id="tkn-card">
+    <div class="sect" style="color:#ffa726">Dhan Token (Roz Update Karo)</div>
+    <textarea id="i-tkn" class="inp" rows="2" placeholder="Yahan Dhan token paste karo..."></textarea>
+    <button class="btn btn-b" onclick="saveToken()" style="width:100%">Save Token</button>
+    <div id="tkn-msg" style="color:#00e676;font-size:11px;margin-top:4px;text-align:center"></div>
+  </div>
   <div class="g2" style="margin-bottom:10px">
     <div class="stat-box"><div class="stat-num" id="s-pnl">--</div><div class="stat-lbl">Today P&L</div></div>
     <div class="stat-box"><div class="stat-num" id="s-funds">--</div><div class="stat-lbl">Available</div></div>
